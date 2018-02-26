@@ -19,6 +19,13 @@ import doctest
 import matplotlib.lines as plt_line
 import matplotlib
 
+from xbos.services import mdal
+from xbos.services.hod import HodClient
+from xbos.services.mdal import *
+
+
+
+
 
 # In[11]:
 
@@ -28,74 +35,119 @@ from xbos.services.pundat import DataClient, timestamp, make_dataframe, merge_df
 from xbos.services.hod import HodClient
 
 
+
 # In[12]:
 class Occupancy():
     def __init__(self):
-        # get a bosswave client
-        c = get_client(entity="/Users/Daniel/CIEE/SetUp/ciee_readonly.ent", agent="127.0.0.1:28589")
-        # get a HodDB client
-        self.hod = HodClient("ciee/hod", c)
-        # get an archiver client
-        self.archiver = DataClient(c, archivers=["ucberkeley"])
+        # data clients
+        self.client = mdal.MDALClient("xbos/mdal")
+        self.hod = HodClient("xbos/hod")
+        self.SITE = "ciee"
+
         self.zone_sensor_df = self.get_occupancy()
         self.building_df = self.get_building_occupany()
         self.zone_df = self.get_zone_occupancy()
 
 
-    def get_occupancy(self, start='"2017-09-01 00:00:00 MST"', end='"2017-09-12 00:00:00 MST"', time_steps="15T"):
-        """Returns a dictionary {Zone: occupancy_data} where the occupancy data is a pandas
-        dataframe, where each column represents a sensor. It is indexed as timeseries data with time_steps as given.
-        It has all the data in the range of times start to end as given.
-        Note, the data is given in MST time as that is how it stores. We will convert it in the function to PST.
-        Parameters:
-            start: When should the data start. Has to be a string of a string '"Time"'.
-            end: when should the data end. Has to be a string of a string '"Time"'.
-            time_steps: in what intervals (start, start+time+steps) do we want to look at data. 
-                        If a sensor regiester someone in those 15minutes,
-                        then we will treat the whole 15 minute as being occupied. (Is this a valid assumption?) 
+    def get_occupancy(self, start="2017-09-01 00:00:00 PST", end="2017-09-12 00:00:00 PST", time_steps="15m"):
+        """Get occupancy for dates specified.
+        param:
+            start: (string, "%Y-%m-%d %H:%M:%S %Z") When should the data start.
+            end:  (string, "%Y-%m-%d %H:%M:%S %Z") when should the data end.
+            time_steps: in what intervals (start, start+time+steps) do we want to look at data.
         Returns:
-            A dataframe. Only returns the data for whole days. Will truncate edge days if needed.
-        IMPROVEMENT TO ME: maybe make it such that we don't have to store the data in a different cell. such that
-                we only ever have to make a call to this function, and it will somehow store the already pulled function, 
-                such that it doesn't have to pull it over and over again.
+            (pandas DF) Index: Timerseries, Column: Boolean. If sensor located someone, we will set the interval to be occupied and True.
         """
+
+        # Brick queries
+        zone_query = """SELECT ?zone FROM %s WHERE {
+            ?zone rdf:type brick:HVAC_Zone .
+        };"""
+
         # define a Brick query to get the occupancy information
-        q = """SELECT ?zone ?sensor_uuid WHERE {
-           ?zone rdf:type brick:HVAC_Zone .
-           ?zone bf:hasPart ?room .
+        occupancy_query = """SELECT ?sensor_uuid FROM %s WHERE {
+           ?sensor bf:hasPoint/bf:isPointOf+ <%s> .
            ?sensor bf:isLocatedIn ?room .
            ?sensor rdf:type/rdfs:subClassOf* brick:Occupancy_Sensor .
            ?sensor bf:uuid ?sensor_uuid .
         };
         """
-        result = self.hod.do_query(q)['Rows']
-        occupancy_sensors = defaultdict(list)
-        for sensor in result:
-            occupancy_sensors[sensor['?zone']].append(sensor['?sensor_uuid'])
-        zone_sensor_df = defaultdict()
-        for zone, sensor_uuid in occupancy_sensors.items():
-            occupancy_data = make_dataframe(self.archiver.data_uuids(sensor_uuid, start, end, timeout=300))
-            occupancy_df = merge_dfs(occupancy_data, resample=time_steps, do_max=True)
-            idx = occupancy_df.index
-            idx = idx.tz_localize(pytz.utc).tz_convert(tz)
-            occupancy_df.index = idx
-            #The following will make sure that we only have whole days in the returned DF. Only because of timezones.
-            # Need to truncate ends since we don't have more data.
-            if occupancy_df.index[0].time() > pd.Timestamp("00:00:00").time():
-                temp = occupancy_df.index[0]
-                d_temp = pd.Timestamp(temp + pd.Timedelta("1 days"))
-                d_temp = d_temp.replace(hour=0,minute=0,second=0)
-                occupancy_df = occupancy_df.loc[d_temp:]
 
-            if occupancy_df.index[-1].time() < pd.Timestamp("23:45:00").time():
-                temp = occupancy_df.index[-1]
-                d_temp = pd.Timestamp(temp + pd.Timedelta("-1 days"))
-                d_temp = d_temp.replace(hour=23,minute=45,second=0)
-                occupancy_df = occupancy_df.loc[:d_temp]
+        zones = [x['?zone']['Namespace']+'#'+x['?zone']['Value'] for x in self.hod.do_query(zone_query % self.SITE, values_only=False)['Rows']]
+        print(zones)
+        ret = {}
+        for zone in zones:
+            print occupancy_query % (self.SITE, zone)
+            tstat_data_query = {
+                "Composition": ["occupancy_sensor"],
+                "Selectors": [MEAN, MAX, MEAN],
+                "Variables": [
+                    {
+                        "Name": "occupancy_sensor",
+                        "Definition": occupancy_query % (self.SITE, zone),
+                        "Units": "C",
+                    },
+                ],
+                "Time": {
+                    "T0": start, "T1": end,
+                    "WindowSize": time_steps,
+                    "Aligned": True,
+                }
+            }
+            resp = self.client.do_query(tstat_data_query, timeout=120)
+            print(resp)
+
+            if resp.get('error'):
+                print resp['error']
+                continue
+            print(resp)
+            df = resp['df']
+
+            df=df.dropna()
+            print df.describe()
+            thermal_data = shuffle(df)
+            ret[zone] = df
+        return ret
+
+
+        # # define a Brick query to get the occupancy information
+        # q = """SELECT ?zone ?sensor_uuid WHERE {
+        #    ?zone rdf:type brick:HVAC_Zone .
+        #    ?zone bf:hasPart ?room .
+        #    ?sensor bf:isLocatedIn ?room .
+        #    ?sensor rdf:type/rdfs:subClassOf* brick:Occupancy_Sensor .
+        #    ?sensor bf:uuid ?sensor_uuid .
+        # };
+        # """
+
+        # result = self.hod.do_query(q)['Rows']
+        # occupancy_sensors = defaultdict(list)
+        # for sensor in result:
+        #     occupancy_sensors[sensor['?zone']].append(sensor['?sensor_uuid'])
+        # zone_sensor_df = defaultdict()
+        # for zone, sensor_uuid in occupancy_sensors.items():
+        #     occupancy_data = make_dataframe(self.archiver.data_uuids(sensor_uuid, start, end, timeout=300))
+        #     occupancy_df = merge_dfs(occupancy_data, resample=time_steps, do_max=True)
+        #     idx = occupancy_df.index
+        #     idx = idx.tz_localize(pytz.utc).tz_convert(tz)
+        #     occupancy_df.index = idx
+        #     #The following will make sure that we only have whole days in the returned DF. Only because of timezones.
+        #     # Need to truncate ends since we don't have more data.
+        #     if occupancy_df.index[0].time() > pd.Timestamp("00:00:00").time():
+        #         temp = occupancy_df.index[0]
+        #         d_temp = pd.Timestamp(temp + pd.Timedelta("1 days"))
+        #         d_temp = d_temp.replace(hour=0,minute=0,second=0)
+        #         occupancy_df = occupancy_df.loc[d_temp:]
+
+        #     if occupancy_df.index[-1].time() < pd.Timestamp("23:45:00").time():
+        #         temp = occupancy_df.index[-1]
+        #         d_temp = pd.Timestamp(temp + pd.Timedelta("-1 days"))
+        #         d_temp = d_temp.replace(hour=23,minute=45,second=0)
+        #         occupancy_df = occupancy_df.loc[:d_temp]
             
-            zone_sensor_df[zone] = 1*(occupancy_df > 0)
+        #     zone_sensor_df[zone] = 1*(occupancy_df > 0)
 
-        return zone_sensor_df
+        # return zone_sensor_df
 
 
     def compute_envelope(self, start="08:00:00", end="18:00:00", time_steps="15T"):
@@ -356,31 +408,22 @@ class Occupancy():
             We will use a linear model for now to determine how similar a day is. Meaning, that if compare_d
         is num_c away from main_d, we will return 0.5.
         Parameters: 
-                main_d: The date I want to compare everything with.
-                compare_d: The day for which I want to see if it is in the same class as main_d.
-                num_c: The max number of same class days between main_d and compare_d.
+                main_d: (datetime) The date I want to compare everything with.
+                compare_d: (datetime) The day for which I want to see if it is in the same class as main_d.
+                num_c: (int) The max number of same class days between main_d and compare_d.
         Returns:
-            An float. Representing how similar the day is to the given day. For now we will use a linear model."""
-        num_c = float(num_c)
-        temp_diff = (abs((main_d.date() - compare_d.date()).days) - main_d.weekday()) # Sets up how many days away compare_d is from the beginning of the week of main_d.
-        num_weeks = temp_diff // 7 # number of weeks from beginning of the week
-        if main_d.weekday() <= 4 and compare_d.weekday() <=4: # for weekdays
-            remain = (temp_diff - 2) % 7 # adjusts it so i don't have to worry about weekends in the remainder
-            if num_weeks < 0: # if negative, then I know that my compare_d is not more than a week away. So all days between are valid days.
-                diff = num_c - abs((main_d.date() - compare_d.date()).days)
-                return diff/num_c if diff > 0 else 0
-            diff = num_c - (main_d.weekday() + num_weeks * 5 + remain) # check if the number of valid days in the weeks between, 
-                                                                        #minus the days i subtracted for temp_diff, and the remainder days are not more than num_class days. 
-            return diff/num_c if diff > 0 else 0
-        elif main_d.weekday() > 4 and compare_d.weekday() > 4: # for weekends
-            remain = 2 if (temp_diff%7) > 2 and num_weeks >= 0 else (temp_diff%7)
-            if num_weeks < 0:
-                diff = num_c - (abs((main_d.date() - compare_d.date()).days))
-                return diff/num_c if diff > 0 else 0    
-            diff = num_c - ((main_d.weekday() - 5) + num_weeks * 2 + remain)
-            return diff/num_c if diff > 0 else 0
-        return 0
-            
+            (float) Representing how similar the day is to the given day. For now we will use a linear model (i.e. (#same class days between
+                main_d and compare_d)/num_c). #same class days betweeen main_d and compare_d is inclusive of compare_d but exclusive of main_d"""
+        dt = main_d.date() - compare_d.date() # number days between them 
+        wkd_dt = main_d.weekday() - compare_d.weekday() # the weekday difference
+        num_weeks = (dt.days - wkd_dt)/float(7) # implicitly finding the same weekday in the compare_d week. Num #num_days is a multiple of 7.
+        if main_d.weekday() <= 4 and compare_d.weekday() <=4 and dt.days > 0 and (5*num_weeks + wkd_dt) < num_c: # for weekdays
+            return 1 - (5*num_weeks + wkd_dt)/float(num_c) # 5 * num_weeks between the weeks they are in + the weekday difference
+        elif main_d.weekday() > 4 and compare_d.weekday() > 4 and dt.days > 0 and (2*num_weeks + wkd_dt) < num_c: # for weekends
+            return 1 - (2*num_weeks + wkd_dt)/float(num_c) # 2 * num_weeks between the weeks they are in + the weekday difference
+        else: # if both day are not the same class or if compare_d is not in the past of main_d or more than num_c class days.
+            return 0 
+                
             
 
     def cond_adaptive(self, class_weight, num_same_class, num_same_day):
@@ -412,7 +455,7 @@ class Occupancy():
         
 
     # IMPROVEMENT: Give it sort of learning rate. The further back the days are, the less they count. 
-    def adaptive_schedule(self, data, day, num_classes, num_same_days):
+    def adaptive_schedule(self, data, day, num_classes, num_same_days, cutoff):
         """Will return an adaptive schedule for the given data, looking at the past data given. Produces an adaptive
         schedule depending on which days should be considered. For this purpose we will use same weekday and same classes
         (weekday or weekend day).
@@ -427,7 +470,7 @@ class Occupancy():
             A Pandas Series with True for having the schedule on and False for having it off."""
         his = self.compute_histogram(data=data, cond_weight=self.cond_adaptive(self.weekday_weekend, 10, 10), equivalence_classes=[day])
         temp = his[day]
-        schedule = 1*((temp[0] / float(max(temp[0]))) >= 0.50) # TODO need to reconsider what we are doing here. What should be the cutoff with variable weights?
+        schedule = 1*((temp[0] / float(max(temp[0]))) >= cutoff) # TODO need to reconsider what we are doing here. What should be the cutoff with variable weights?
         return schedule
 
     

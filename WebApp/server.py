@@ -33,7 +33,3 @@ def test():
 @app.route('/')
 def root():
 	return app.send_static_file('./WebApp.html')
-
-@app.route('/play')
-def graph():
-	return app.send_static_file('./index.html')
