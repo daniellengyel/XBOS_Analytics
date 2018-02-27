@@ -23,10 +23,7 @@ def test():
 	print(building)
 	zone = request.form.get('zone')
 	print(zone)
-	if "Zone" in zone:
-		schedule = Occ.adaptive_schedule(Occ.zone_df[zone], day, numClasses, numDays)
-	else:
-		schedule = Occ.adaptive_schedule(Occ.building_df, day, numClasses, numDays)
+	schedule = Occ.adaptive_schedule(zone , day, numClasses, numDays, cutoffPercentage)
 	return schedule.to_json()
 
 

@@ -6,6 +6,10 @@
 #NOTE: we assume all time series data in PST time. Only time we are working with non PST data is when 
 # we receive data and then convert. See get_occupancy function for how to do that.
 # base imports
+
+# SOME IMPORTS SEEM TO OVERRIDE DATETIME TO DATETIME.DATETIME. HACK FOR NOW IS TO LET DATETIME = DATI
+import datetime as dati
+
 import time
 from collections import defaultdict
 import pandas as pd
@@ -14,7 +18,7 @@ from matplotlib import pyplot as plt
 import matplotlib as mpl
 import numpy as np
 import pytz
-tz = pytz.timezone("US/Pacific")
+
 import doctest
 import matplotlib.lines as plt_line
 import matplotlib
@@ -22,10 +26,6 @@ import matplotlib
 from xbos.services import mdal
 from xbos.services.hod import HodClient
 from xbos.services.mdal import *
-
-
-
-
 
 # In[11]:
 
@@ -38,26 +38,41 @@ from xbos.services.hod import HodClient
 
 # In[12]:
 class Occupancy():
-    def __init__(self):
+    def __init__(self, start=None, end=None, timezone='US/Pacific'):
+        """        params:
+            start: (string, "%Y-%m-%d %H:%M:%S %Z") When should the data start.
+            end:  (string, "%Y-%m-%d %H:%M:%S %Z") when should the data end.
+            timezone: (string) As used by pytz. Used for both start and end
+        """
         # data clients
         self.client = mdal.MDALClient("xbos/mdal")
         self.hod = HodClient("xbos/hod")
         self.SITE = "ciee"
+        tz = pytz.timezone('US/Pacific')
+
+        temp_end = dati.datetime.today() if end is None else datetime.strptime(end, "%Y-%m-%d %H:%M:%S %Z")
+        temp_start = (temp_end - dati.timedelta(10)) if start is None else datetime.strptime(start, "%Y-%m-%d %H:%M:%S %Z")
+
+        self.end = tz.localize(temp_end)
+        self.start = tz.localize(temp_start)
+
 
         self.zone_sensor_df = self.get_occupancy()
-        self.building_df = self.get_building_occupany()
+        self.building_df = self.get_building_occupancy()
         self.zone_df = self.get_zone_occupancy()
 
 
-    def get_occupancy(self, start="2017-09-01 00:00:00 PST", end="2017-09-12 00:00:00 PST", time_steps="15m"):
+    def get_occupancy(self, start=None, end=None, time_steps="15m"):
         """Get occupancy for dates specified.
         param:
-            start: (string, "%Y-%m-%d %H:%M:%S %Z") When should the data start.
-            end:  (string, "%Y-%m-%d %H:%M:%S %Z") when should the data end.
+            start: (datetime) When should the data start.
+            end:  (datetime) when should the data end.
             time_steps: in what intervals (start, start+time+steps) do we want to look at data.
         Returns:
             (pandas DF) Index: Timerseries, Column: Boolean. If sensor located someone, we will set the interval to be occupied and True.
         """
+        start = self.start.strftime("%Y-%m-%d %H:%M:%S %Z") if start is None else start.strftime("%Y-%m-%d %H:%M:%S %Z")
+        end = self.end.strftime("%Y-%m-%d %H:%M:%S %Z") if end is None else end.strftime("%Y-%m-%d %H:%M:%S %Z")
 
         # Brick queries
         zone_query = """SELECT ?zone FROM %s WHERE {
@@ -66,7 +81,7 @@ class Occupancy():
 
         # define a Brick query to get the occupancy information
         occupancy_query = """SELECT ?sensor_uuid FROM %s WHERE {
-           ?sensor bf:hasPoint/bf:isPointOf+ <%s> .
+           ?sensor bf:isPointOf/bf:isPartOf <%s> .
            ?sensor bf:isLocatedIn ?room .
            ?sensor rdf:type/rdfs:subClassOf* brick:Occupancy_Sensor .
            ?sensor bf:uuid ?sensor_uuid .
@@ -74,10 +89,8 @@ class Occupancy():
         """
 
         zones = [x['?zone']['Namespace']+'#'+x['?zone']['Value'] for x in self.hod.do_query(zone_query % self.SITE, values_only=False)['Rows']]
-        print(zones)
         ret = {}
         for zone in zones:
-            print occupancy_query % (self.SITE, zone)
             tstat_data_query = {
                 "Composition": ["occupancy_sensor"],
                 "Selectors": [MEAN, MAX, MEAN],
@@ -95,59 +108,15 @@ class Occupancy():
                 }
             }
             resp = self.client.do_query(tstat_data_query, timeout=120)
-            print(resp)
-
             if resp.get('error'):
-                print resp['error']
                 continue
+            print("zone: ", zone)
             print(resp)
             df = resp['df']
 
             df=df.dropna()
-            print df.describe()
-            thermal_data = shuffle(df)
             ret[zone] = df
         return ret
-
-
-        # # define a Brick query to get the occupancy information
-        # q = """SELECT ?zone ?sensor_uuid WHERE {
-        #    ?zone rdf:type brick:HVAC_Zone .
-        #    ?zone bf:hasPart ?room .
-        #    ?sensor bf:isLocatedIn ?room .
-        #    ?sensor rdf:type/rdfs:subClassOf* brick:Occupancy_Sensor .
-        #    ?sensor bf:uuid ?sensor_uuid .
-        # };
-        # """
-
-        # result = self.hod.do_query(q)['Rows']
-        # occupancy_sensors = defaultdict(list)
-        # for sensor in result:
-        #     occupancy_sensors[sensor['?zone']].append(sensor['?sensor_uuid'])
-        # zone_sensor_df = defaultdict()
-        # for zone, sensor_uuid in occupancy_sensors.items():
-        #     occupancy_data = make_dataframe(self.archiver.data_uuids(sensor_uuid, start, end, timeout=300))
-        #     occupancy_df = merge_dfs(occupancy_data, resample=time_steps, do_max=True)
-        #     idx = occupancy_df.index
-        #     idx = idx.tz_localize(pytz.utc).tz_convert(tz)
-        #     occupancy_df.index = idx
-        #     #The following will make sure that we only have whole days in the returned DF. Only because of timezones.
-        #     # Need to truncate ends since we don't have more data.
-        #     if occupancy_df.index[0].time() > pd.Timestamp("00:00:00").time():
-        #         temp = occupancy_df.index[0]
-        #         d_temp = pd.Timestamp(temp + pd.Timedelta("1 days"))
-        #         d_temp = d_temp.replace(hour=0,minute=0,second=0)
-        #         occupancy_df = occupancy_df.loc[d_temp:]
-
-        #     if occupancy_df.index[-1].time() < pd.Timestamp("23:45:00").time():
-        #         temp = occupancy_df.index[-1]
-        #         d_temp = pd.Timestamp(temp + pd.Timedelta("-1 days"))
-        #         d_temp = d_temp.replace(hour=23,minute=45,second=0)
-        #         occupancy_df = occupancy_df.loc[:d_temp]
-            
-        #     zone_sensor_df[zone] = 1*(occupancy_df > 0)
-
-        # return zone_sensor_df
 
 
     def compute_envelope(self, start="08:00:00", end="18:00:00", time_steps="15T"):
@@ -192,7 +161,7 @@ class Occupancy():
             result[zone] = temp.apply(lambda x: max(x), axis = 1)
         return result
 
-    def get_building_occupany(self, cond=(lambda x: True)):
+    def get_building_occupancy(self, cond=(lambda x: True)):
         """Returns the logical or of all sensors.
         Parameters:
             cond: A function on a timestamp by which to filter the data.
@@ -443,10 +412,14 @@ class Occupancy():
         def final_cond(d, e):
             """Returns a float weighting for the day we compare to the equivalence which is our main day. According
             to what we expect from the cond_adaptive function."""
-            day_same = 4*int(d.weekday() == e.weekday())*(abs((d.date() - e.date()).days) / float(7*num_same_day))
+            dt = (e.date() - d.date()).days
+            if d.weekday() == e.weekday() and dt > 0:
+                day_same = (1 - dt/float(7*num_same_day))
+            else:
+                day_same = 0
             class_same = (class_weight(e, d, num_same_class))
             # want to give it the largest weight we get.
-            # IS THIS DESIRABLE? SHOULD WE JUST RETURN THE SUM??
+            # IS THIS DESIRABLE? SHOULD WE JUST RETURN THE average??
             if day_same > class_same:
                 return day_same * int(d.date() != e.date())
             else:
@@ -455,19 +428,40 @@ class Occupancy():
         
 
     # IMPROVEMENT: Give it sort of learning rate. The further back the days are, the less they count. 
-    def adaptive_schedule(self, data, day, num_classes, num_same_days, cutoff):
+    def adaptive_schedule(self, zone, day, num_classes, num_same_days, cutoff):
         """Will return an adaptive schedule for the given data, looking at the past data given. Produces an adaptive
         schedule depending on which days should be considered. For this purpose we will use same weekday and same classes
         (weekday or weekend day).
         Parameters:
-            data: The data over which we find the schedule, should start the day before the given day. Is a pandas
-                Dataframe with only one column or Pandas Series.
-            day: A pd Timestamp day. We will generate the schedule for this day.
+            zone: (string) Zones from building for which i have the occupancy 
+            day: (datetime) We will generate the schedule for this day.
             num_same_class: The number of days that should be in the same class as the date. For current purposes
                         the same class means that they are weekdays/weekends.
             num_same_date: The number of days which are the same weekdays as my given date.
         Returns:
             A Pandas Series with True for having the schedule on and False for having it off."""
+        if day.weekday() <= 4:
+            temp_days = max(7*(num_classes//5 + 1), num_same_days*7) # taking the max of possible days to account for num_classes or num_same_days. num_classes//# + 1 used to roughly round up.
+        else:
+            temp_days = max(7*(num_classes//2 + 1), num_same_days*7)
+
+        temp_start = day - dati.timedelta(temp_days)
+
+        # this is super ugly. Should hide this in getting the occupancy
+        if self.start > temp_start or (self.end < day and self.end.date != dati.date.today()):
+            self.start = temp_start
+            if day > dati.datetime.today():
+                self.end = dati.datetime.today()
+            else:
+                self.end = day
+            self.zone_sensor_df = self.get_occupancy()
+            self.building = self.get_building_occupany()
+            self.zone_df = self.get_zone_occupancy()
+        if "Building" in zone:
+            data = self.building
+        else:
+            data = self.zone_df[zone] 
+
         his = self.compute_histogram(data=data, cond_weight=self.cond_adaptive(self.weekday_weekend, 10, 10), equivalence_classes=[day])
         temp = his[day]
         schedule = 1*((temp[0] / float(max(temp[0]))) >= cutoff) # TODO need to reconsider what we are doing here. What should be the cutoff with variable weights?
